@@ -1,0 +1,657 @@
+name: Build IcePix
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: IcePix   # название приложения: только латинские буквы и цифры, без пробелов
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Создать проект
+        run: |
+          mkdir -p project/app/src/main/java/com/icecanvas/app project/app/src/main/assets
+          cd project
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "IcePix"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+          }
+
+          android {
+              namespace = "com.icecanvas.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.icecanvas.app"
+                  minSdk = 29          // Android 10
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("armeabi-v7a") } // 32 бит
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation("androidx.webkit:webkit:1.11.0")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="IcePix"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/icecanvas/app/MainActivity.java <<'EOF'
+          package com.icecanvas.app;
+
+          import android.app.Activity;
+          import android.content.ContentResolver;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Toast;
+
+          import androidx.webkit.WebViewAssetLoader;
+
+          import java.io.OutputStream;
+
+          public class MainActivity extends Activity {
+              private static final int PICK_IMAGE = 1;
+              private WebView web;
+              private ValueCallback<Uri[]> fileCallback;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  web = new WebView(this);
+                  setContentView(web);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+
+                  // Страница из assets открывается по https-адресу
+                  final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
+                          .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                          .build();
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                          return loader.shouldInterceptRequest(request.getUrl());
+                      }
+                  });
+
+                  // Кнопка «Фото» открывает системный выбор картинки
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                                       FileChooserParams params) {
+                          if (fileCallback != null) fileCallback.onReceiveValue(null);
+                          fileCallback = callback;
+                          Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                          intent.addCategory(Intent.CATEGORY_OPENABLE);
+                          intent.setType("image/*");
+                          try {
+                              startActivityForResult(intent, PICK_IMAGE);
+                          } catch (Exception e) {
+                              fileCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  web.addJavascriptInterface(new Bridge(), "Android");
+                  web.loadUrl("https://appassets.androidplatform.net/assets/index.html");
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == PICK_IMAGE && fileCallback != null) {
+                      fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
+                      fileCallback = null;
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (web != null) web.destroy();
+                  super.onDestroy();
+              }
+
+              private class Bridge {
+                  @JavascriptInterface
+                  public void savePng(String base64) {
+                      boolean ok;
+                      try {
+                          ok = saveToGallery(Base64.decode(base64, Base64.DEFAULT));
+                      } catch (IllegalArgumentException e) {
+                          ok = false;
+                      }
+                      final boolean result = ok;
+                      runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                              result ? "Сохранено в Pictures/IcePix" : "Ошибка сохранения",
+                              Toast.LENGTH_SHORT).show());
+                  }
+              }
+
+              /** Сохраняет PNG в галерею. На Android 10+ разрешения не нужны. */
+              private boolean saveToGallery(byte[] png) {
+                  ContentResolver resolver = getContentResolver();
+                  ContentValues values = new ContentValues();
+                  values.put(MediaStore.Images.Media.DISPLAY_NAME, "IcePix_" + System.currentTimeMillis() + ".png");
+                  values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+                  values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/IcePix");
+                  values.put(MediaStore.Images.Media.IS_PENDING, 1);
+
+                  Uri uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                  if (uri == null) return false;
+                  try (OutputStream out = resolver.openOutputStream(uri)) {
+                      if (out == null) throw new IllegalStateException("Нет потока записи");
+                      out.write(png);
+                  } catch (Exception e) {
+                      resolver.delete(uri, null, null);
+                      return false;
+                  }
+                  values.clear();
+                  values.put(MediaStore.Images.Media.IS_PENDING, 0);
+                  resolver.update(uri, values, null, null);
+                  return true;
+              }
+          }
+          EOF
+
+          cat > app/src/main/assets/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="ru">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+          <title>IcePix</title>
+          <style>
+            * { box-sizing: border-box; }
+            html, body { margin: 0; height: 100%; overscroll-behavior: none; }
+            body { display: flex; flex-direction: column; height: 100vh; height: 100dvh;
+              font-family: system-ui, sans-serif; background: #e1f5fe; color: #01303f; }
+            header { display: flex; align-items: center; gap: 4px; padding: 6px 8px; overflow-x: auto;
+              white-space: nowrap; background: #f5fcff; border-bottom: 1px solid #b3e5fc; }
+            h1 { font-size: 20px; margin: 0 8px 0 0; color: #0277bd; }
+            button, .btn { min-height: 44px; padding: 0 14px; border-radius: 22px; font-size: 15px;
+              border: 1px solid #0277bd; background: #fff; color: #0277bd; cursor: pointer;
+              display: inline-flex; align-items: center; justify-content: center; }
+            button[aria-pressed="true"] { background: #0277bd; color: #fff; }
+            button:focus-visible, .btn:focus-within, input:focus-visible { outline: 3px solid #4fc3f7; outline-offset: 2px; }
+            .flat { border-color: transparent; background: transparent; }
+            #stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center;
+              background: #b3e5fc; overflow: hidden; }
+            #view { touch-action: none; box-shadow: 0 2px 10px rgba(0,0,0,.25);
+              background: repeating-conic-gradient(#ddd 0 25%, #fff 0 50%) 0 0 / 20px 20px; }
+            #panel { max-height: 42vh; max-height: 42dvh; overflow-y: auto; padding: 8px 10px 16px; background: #f5fcff; }
+            .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+            .swatch { width: 44px; height: 44px; padding: 0; border-radius: 50%; border: 1px solid #888; }
+            .swatch[aria-pressed="true"] { border: 3px solid #0277bd; }
+            input[type="color"] { width: 44px; height: 44px; border: none; padding: 0; background: none; }
+            input[type="range"] { width: 100%; }
+            h2 { font-size: 15px; margin: 12px 0 4px; }
+            #layers { list-style: none; margin: 0; padding: 0; }
+            .layer { padding: 4px 8px; border-radius: 8px; }
+            .layer.active { background: #b3e5fc; }
+            .layer-head { display: flex; align-items: center; gap: 8px; }
+            .layer input[type="checkbox"] { width: 24px; height: 24px; }
+            .layer-name { flex: 1; justify-content: flex-start; border: none; background: transparent; color: inherit; }
+            .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+          </style>
+          </head>
+          <body>
+          <header>
+            <h1>IcePix</h1>
+            <label class="btn flat">Фото
+              <input id="file" type="file" accept="image/*" class="visually-hidden">
+            </label>
+            <button class="flat" id="undo">Отмена</button>
+            <button class="flat" id="redo">Повтор</button>
+            <button class="flat" id="save">Сохранить</button>
+          </header>
+
+          <main id="stage">
+            <canvas id="view" role="img" aria-label="Холст для рисования"></canvas>
+          </main>
+
+          <section id="panel">
+            <div class="row">
+              <button id="toolBrush" aria-pressed="true">Кисть</button>
+              <button id="toolEraser" aria-pressed="false">Ластик</button>
+            </div>
+            <div class="row" id="palette" aria-label="Цвета"></div>
+
+            <label for="size">Размер: <span id="sizeVal">20</span> px</label>
+            <input id="size" type="range" min="1" max="150" value="20">
+            <label for="alpha">Непрозрачность кисти: <span id="alphaVal">100</span>%</label>
+            <input id="alpha" type="range" min="5" max="100" value="100">
+
+            <h2>Фильтры для активного слоя</h2>
+            <div class="row">
+              <button data-filter="gray">Ч/Б</button>
+              <button data-filter="sepia">Сепия</button>
+              <button data-filter="invert">Инверсия</button>
+            </div>
+
+            <h2>Слои</h2>
+            <div class="row">
+              <button class="flat" id="layerAdd">Добавить</button>
+              <button class="flat" id="layerDel">Удалить</button>
+              <button class="flat" id="layerUp">Выше</button>
+              <button class="flat" id="layerDown">Ниже</button>
+            </div>
+            <ul id="layers"></ul>
+          </section>
+
+          <script>
+          "use strict";
+          // На слабых телефонах можно уменьшить до 720x960
+          const W = 1080, H = 1440, MAX_HISTORY = 10;
+          const $ = id => document.getElementById(id);
+          const view = $("view"), stage = $("stage");
+          view.width = W; view.height = H;
+          const vctx = view.getContext("2d");
+
+          function makeCanvas() { const c = document.createElement("canvas"); c.width = W; c.height = H; return c; }
+
+          const state = { layers: [], active: 0, tool: "brush", color: "#000000", size: 20, alpha: 1, counter: 0 };
+          const activeLayer = () => state.layers[state.active];
+
+          // ---------- Отрисовка ----------
+          const strokeCanvas = makeCanvas(), sctx = strokeCanvas.getContext("2d");
+          const tmp = makeCanvas(), tctx = tmp.getContext("2d");
+          let stroking = false, pts = [], renderPending = false;
+
+          function requestRender() { if (!renderPending) { renderPending = true; requestAnimationFrame(render); } }
+
+          function render() {
+            renderPending = false;
+            vctx.clearRect(0, 0, W, H);
+            state.layers.forEach((l, i) => {
+              if (!l.visible) return;
+              let src = l.canvas;
+              if (stroking && i === state.active) {
+                tctx.globalCompositeOperation = "copy";
+                tctx.drawImage(l.canvas, 0, 0);
+                tctx.globalCompositeOperation = state.tool === "eraser" ? "destination-out" : "source-over";
+                tctx.globalAlpha = state.alpha;
+                tctx.drawImage(strokeCanvas, 0, 0);
+                tctx.globalAlpha = 1;
+                tctx.globalCompositeOperation = "source-over";
+                src = tmp;
+              }
+              vctx.globalAlpha = l.opacity;
+              vctx.drawImage(src, 0, 0);
+            });
+            vctx.globalAlpha = 1;
+          }
+
+          function fitView() {
+            const r = stage.getBoundingClientRect();
+            const k = Math.min(r.width / W, r.height / H);
+            view.style.width = W * k + "px";
+            view.style.height = H * k + "px";
+          }
+          window.addEventListener("resize", fitView);
+
+          // ---------- Слои ----------
+          function addLayer(background = false) {
+            const canvas = makeCanvas(), ctx = canvas.getContext("2d");
+            if (background) { ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, H); }
+            state.layers.push({ name: background ? "Фон" : "Слой " + (++state.counter), canvas, ctx, visible: true, opacity: 1 });
+            state.active = state.layers.length - 1;
+            renderLayers(); requestRender();
+          }
+
+          function removeLayer() {
+            if (state.layers.length <= 1) return;
+            const [removed] = state.layers.splice(state.active, 1);
+            purge(undoStack, removed); purge(redoStack, removed);
+            state.active = Math.min(state.active, state.layers.length - 1);
+            renderLayers(); requestRender();
+          }
+
+          function moveLayer(delta) {
+            const t = state.active + delta, L = state.layers;
+            if (t < 0 || t >= L.length) return;
+            [L[state.active], L[t]] = [L[t], L[state.active]];
+            state.active = t;
+            renderLayers(); requestRender();
+          }
+
+          function renderLayers() {
+            const list = $("layers");
+            list.innerHTML = "";
+            for (let i = state.layers.length - 1; i >= 0; i--) {
+              const l = state.layers[i], isActive = i === state.active;
+              const li = document.createElement("li");
+              li.className = "layer" + (isActive ? " active" : "");
+              const head = document.createElement("div");
+              head.className = "layer-head";
+
+              const cb = document.createElement("input");
+              cb.type = "checkbox"; cb.checked = l.visible;
+              cb.setAttribute("aria-label", "Видимость слоя " + l.name);
+              cb.onchange = () => { l.visible = cb.checked; requestRender(); };
+
+              const btn = document.createElement("button");
+              btn.className = "layer-name";
+              btn.textContent = l.name + (isActive ? " (активный)" : "");
+              btn.setAttribute("aria-pressed", String(isActive));
+              btn.onclick = () => { state.active = i; renderLayers(); };
+              head.append(cb, btn);
+              li.append(head);
+
+              if (isActive) {
+                const id = "op" + i;
+                const label = document.createElement("label");
+                label.htmlFor = id;
+                label.textContent = "Прозрачность слоя: " + Math.round(l.opacity * 100) + "%";
+                const range = document.createElement("input");
+                range.type = "range"; range.id = id; range.min = 0; range.max = 100;
+                range.value = Math.round(l.opacity * 100);
+                range.oninput = () => {
+                  l.opacity = range.value / 100;
+                  label.textContent = "Прозрачность слоя: " + range.value + "%";
+                  requestRender();
+                };
+                li.append(label, range);
+              }
+              list.append(li);
+            }
+          }
+
+          // ---------- Отмена / повтор ----------
+          const undoStack = [], redoStack = [];
+          function snapshot(layer) { const c = makeCanvas(); c.getContext("2d").drawImage(layer.canvas, 0, 0); return { layer, canvas: c }; }
+          function restore(s) { s.layer.ctx.clearRect(0, 0, W, H); s.layer.ctx.drawImage(s.canvas, 0, 0); requestRender(); }
+          function pushLimited(stack, s) { stack.push(s); while (stack.length > MAX_HISTORY) stack.shift(); }
+          function saveUndo(layer) { pushLimited(undoStack, snapshot(layer)); redoStack.length = 0; }
+          function purge(stack, layer) { for (let i = stack.length - 1; i >= 0; i--) if (stack[i].layer === layer) stack.splice(i, 1); }
+          function undo() { const s = undoStack.pop(); if (!s) return; pushLimited(redoStack, snapshot(s.layer)); restore(s); }
+          function redo() { const s = redoStack.pop(); if (!s) return; pushLimited(undoStack, snapshot(s.layer)); restore(s); }
+
+          // ---------- Рисование ----------
+          const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+
+          function toDoc(e) {
+            const r = view.getBoundingClientRect();
+            return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+          }
+
+          function setupStrokeStyle() {
+            const c = state.tool === "eraser" ? "#000" : state.color;
+            sctx.strokeStyle = c; sctx.fillStyle = c;
+            sctx.lineWidth = state.size; sctx.lineCap = "round"; sctx.lineJoin = "round";
+          }
+
+          function drawSegment() {
+            const n = pts.length;
+            if (n === 1) {
+              sctx.beginPath();
+              sctx.arc(pts[0].x, pts[0].y, state.size / 2, 0, Math.PI * 2);
+              sctx.fill();
+              return;
+            }
+            const p0 = n > 2 ? mid(pts[n - 3], pts[n - 2]) : pts[0];
+            const p2 = mid(pts[n - 2], pts[n - 1]);
+            sctx.beginPath();
+            sctx.moveTo(p0.x, p0.y);
+            sctx.quadraticCurveTo(pts[n - 2].x, pts[n - 2].y, p2.x, p2.y);
+            sctx.stroke();
+          }
+
+          view.addEventListener("pointerdown", e => {
+            const l = activeLayer();
+            if (stroking || !l || !l.visible) return;
+            view.setPointerCapture(e.pointerId);
+            saveUndo(l);
+            stroking = true;
+            sctx.clearRect(0, 0, W, H);
+            setupStrokeStyle();
+            pts = [toDoc(e)];
+            drawSegment();
+            requestRender();
+          });
+
+          view.addEventListener("pointermove", e => {
+            if (!stroking) return;
+            const list = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+            for (const ev of (list.length ? list : [e])) {
+              pts.push(toDoc(ev));
+              if (pts.length > 3) pts.shift();
+              drawSegment();
+            }
+            requestRender();
+          });
+
+          function endStroke() {
+            if (!stroking) return;
+            if (pts.length >= 2) {
+              const a = mid(pts[pts.length - 2], pts[pts.length - 1]), b = pts[pts.length - 1];
+              sctx.beginPath(); sctx.moveTo(a.x, a.y); sctx.lineTo(b.x, b.y); sctx.stroke();
+            }
+            const ctx = activeLayer().ctx;
+            ctx.globalAlpha = state.alpha;
+            ctx.globalCompositeOperation = state.tool === "eraser" ? "destination-out" : "source-over";
+            ctx.drawImage(strokeCanvas, 0, 0);
+            ctx.globalAlpha = 1;
+            ctx.globalCompositeOperation = "source-over";
+            sctx.clearRect(0, 0, W, H);
+            stroking = false; pts = [];
+            requestRender();
+          }
+          view.addEventListener("pointerup", endStroke);
+          view.addEventListener("pointercancel", endStroke);
+
+          // ---------- Фильтры ----------
+          const FILTERS = {
+            gray(d, i) { const v = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; d[i] = d[i + 1] = d[i + 2] = v; },
+            sepia(d, i) {
+              const r = d[i], g = d[i + 1], b = d[i + 2];
+              d[i] = 0.393 * r + 0.769 * g + 0.189 * b;
+              d[i + 1] = 0.349 * r + 0.686 * g + 0.168 * b;
+              d[i + 2] = 0.272 * r + 0.534 * g + 0.131 * b;
+            },
+            invert(d, i) { d[i] = 255 - d[i]; d[i + 1] = 255 - d[i + 1]; d[i + 2] = 255 - d[i + 2]; }
+          };
+
+          function applyFilter(name) {
+            const l = activeLayer(); if (!l) return;
+            saveUndo(l);
+            const img = l.ctx.getImageData(0, 0, W, H), d = img.data, fn = FILTERS[name];
+            for (let i = 0; i < d.length; i += 4) fn(d, i);
+            l.ctx.putImageData(img, 0, 0);
+            requestRender();
+          }
+
+          // ---------- Фото и сохранение ----------
+          $("file").addEventListener("change", () => {
+            const f = $("file").files[0]; if (!f) return;
+            const url = URL.createObjectURL(f);
+            const img = new Image();
+            img.onload = () => {
+              addLayer();
+              const s = Math.min(W / img.width, H / img.height);
+              const w = img.width * s, h = img.height * s;
+              activeLayer().ctx.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
+              URL.revokeObjectURL(url);
+              requestRender();
+            };
+            img.onerror = () => { URL.revokeObjectURL(url); alert("Не удалось открыть фото"); };
+            img.src = url;
+            $("file").value = "";
+          });
+
+          function save() {
+            const out = makeCanvas(), o = out.getContext("2d");
+            o.fillStyle = "#fff"; o.fillRect(0, 0, W, H);
+            for (const l of state.layers) {
+              if (!l.visible) continue;
+              o.globalAlpha = l.opacity;
+              o.drawImage(l.canvas, 0, 0);
+            }
+            if (window.Android && window.Android.savePng) {
+              window.Android.savePng(out.toDataURL("image/png").split(",")[1]);
+              return;
+            }
+            out.toBlob(blob => {
+              if (!blob) { alert("Ошибка сохранения"); return; }
+              const a = document.createElement("a");
+              a.href = URL.createObjectURL(blob);
+              a.download = "IcePix_" + Date.now() + ".png";
+              document.body.append(a); a.click(); a.remove();
+              setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+            }, "image/png");
+          }
+
+          // ---------- Панель ----------
+          const PALETTE = [
+            ["Чёрный", "#000000"], ["Белый", "#ffffff"], ["Красный", "#e53935"], ["Оранжевый", "#fb8c00"],
+            ["Жёлтый", "#fdd835"], ["Зелёный", "#43a047"], ["Синий", "#1e88e5"], ["Фиолетовый", "#8e24aa"]
+          ];
+
+          function setTool(t) {
+            state.tool = t;
+            $("toolBrush").setAttribute("aria-pressed", String(t === "brush"));
+            $("toolEraser").setAttribute("aria-pressed", String(t === "eraser"));
+          }
+
+          function setColor(c) {
+            state.color = c;
+            document.querySelectorAll(".swatch").forEach(s => s.setAttribute("aria-pressed", String(s.dataset.color === c)));
+            $("customColor").value = c;
+            setTool("brush");
+          }
+
+          const pal = $("palette");
+          for (const [name, c] of PALETTE) {
+            const b = document.createElement("button");
+            b.className = "swatch"; b.style.background = c; b.dataset.color = c;
+            b.setAttribute("aria-label", name);
+            b.onclick = () => setColor(c);
+            pal.append(b);
+          }
+          const custom = document.createElement("input");
+          custom.type = "color"; custom.id = "customColor";
+          custom.setAttribute("aria-label", "Свой цвет");
+          custom.oninput = () => setColor(custom.value);
+          pal.append(custom);
+
+          $("toolBrush").onclick = () => setTool("brush");
+          $("toolEraser").onclick = () => setTool("eraser");
+          $("size").oninput = e => { state.size = +e.target.value; $("sizeVal").textContent = e.target.value; };
+          $("alpha").oninput = e => { state.alpha = e.target.value / 100; $("alphaVal").textContent = e.target.value; };
+          document.querySelectorAll("[data-filter]").forEach(b => b.onclick = () => applyFilter(b.dataset.filter));
+          $("undo").onclick = undo;
+          $("redo").onclick = redo;
+          $("save").onclick = save;
+          $("layerAdd").onclick = () => addLayer();
+          $("layerDel").onclick = removeLayer;
+          $("layerUp").onclick = () => moveLayer(1);
+          $("layerDown").onclick = () => moveLayer(-1);
+
+          addLayer(true);
+          setColor("#000000");
+          fitView();
+          </script>
+          </body>
+          </html>
+          EOF
+
+      # Если в APP_NAME другое имя, этот шаг подставит его во все файлы
+      - name: Поменять название
+        working-directory: project
+        run: grep -rl "IcePix" . | xargs -r sed -i "s/IcePix/${APP_NAME}/g"
+
+      # ZIP с исходниками проекта
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-source
+          path: project
+
+      - name: Сборка
+        working-directory: project
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-apk
+          path: project/app/build/outputs/apk/debug/*.apk
